@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+requests
+PyMuPDF
+openpyxl
+python-multipart
+Pillow
+pandas
+python-dotenv
+openai

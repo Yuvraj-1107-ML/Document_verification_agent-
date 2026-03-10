@@ -1,0 +1,11 @@
+{
+  "fields": [
+    { "name": "company_name",  "pattern": "M/s\\s+(.+?)," },
+    { "name": "address",       "pattern": "Ltd\\.,\\s+(.+?)\\s+is holding" },
+    { "name": "license_no_1",  "pattern": "license\\s+No\\s+([\\w/\\-]+)" },
+    { "name": "form_no_1",     "pattern": "form\\s+(\\d+)" },
+    { "name": "license_no_2",  "pattern": "license\\s+No\\s+([\\w/\\-]+)" },
+    { "name": "form_no_2",     "pattern": "form\\s+(\\d+)" },
+    { "name": "valid_upto",    "pattern": "valid up to\\s+(\\d{1,2}[-/]\\d{2}[-/]\\d{4})" }
+  ]
+}
