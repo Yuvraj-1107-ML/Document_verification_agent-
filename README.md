@@ -1,4 +1,4 @@
-# Document Verification Agent (DocuTrust Bot)
+# Document Verification Agent 
 
 A professional, high-performance document processing system that combines high-accuracy OCR, intelligent field extraction using LLMs, and automated seal detection to verify complex business documents.
 
@@ -64,7 +64,7 @@ A professional, high-performance document processing system that combines high-a
    ```
 2. Install dependencies:
    ```powershell
-   npm install
+   npm i
    ```
 3. Start the development server:
    ```powershell
