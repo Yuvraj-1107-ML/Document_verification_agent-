@@ -1,0 +1,17 @@
+*
+!docu-trust-bot/
+!docu-trust-bot/**/*
+!backend/
+!backend/**/*
+!README.md
+!.gitignore
+
+docu-trust-bot/node_modules/
+docu-trust-bot/dist/
+backend/__pycache__/
+backend/.venv/
+backend/venv/
+backend/env/
+backend/ocr_cache/
+backend/.env
+**/.env

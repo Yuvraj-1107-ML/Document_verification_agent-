@@ -32,17 +32,55 @@ FIELD_SCHEMAS = {
         "FDA Address"
 
     ],
+    "tender-fee-emd-proof": [
+        "Tender Fee Paid Online (Yes/No)",
+        "EMD Paid Online (Yes/No)",
+        "Submitted EMD Amount",
+        "UTR Number",
+        "Address",
+        "Seal Present (Yes/No)",
+    ],
+    "emd-exemption-cert": [
+        "EMD Exemption Applicable (Yes/No)",
+        "Certificate Not Applicable Statement (Yes/No)",
+        "Address",
+        "Subject",
+        "Tender Reference Number",
+        "Seal Present (Yes/No)",
+    ],
 }
 
 
 class LLMExtractor:
     def __init__(self):
-        self.client = AzureOpenAI(
-            api_key=os.getenv("AZURE_OPENAI_API_KEY"),
-            api_version=os.getenv("AZURE_OPENAI_API_VERSION", "2024-12-01-preview"),
-            azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
-        )
         self.deployment = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME", "gpt-4o")
+        self._client = None
+
+    def _get_client(self) -> AzureOpenAI:
+        """
+        Lazily create the Azure OpenAI client.
+
+        This prevents the backend from failing to start when Azure credentials
+        are not configured (exports and other non-LLM routes should still work).
+        """
+        if self._client is not None:
+            return self._client
+
+        api_key = os.getenv("AZURE_OPENAI_API_KEY")
+        endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
+        api_version = os.getenv("AZURE_OPENAI_API_VERSION", "2024-12-01-preview")
+
+        if not api_key or not endpoint:
+            raise RuntimeError(
+                "Azure OpenAI credentials are not configured (AZURE_OPENAI_API_KEY / AZURE_OPENAI_ENDPOINT)."
+            )
+
+        self._client = AzureOpenAI(
+            api_key=api_key,
+            api_version=api_version,
+            azure_endpoint=endpoint,
+        )
+        return self._client
 
     def extract_fields(self, ocr_text: str, doc_type: str) -> list:
         """
@@ -84,7 +122,8 @@ OCR Text:
 {truncated_text}"""
 
         try:
-            response = self.client.chat.completions.create(
+            client = self._get_client()
+            response = client.chat.completions.create(
                 model=self.deployment,
                 messages=[
                     {"role": "system", "content": system_prompt},

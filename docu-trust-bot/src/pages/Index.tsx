@@ -4,7 +4,8 @@ import { RotateCcw, FileArchive, ShieldCheck } from "lucide-react";
 import DocumentUpload from "@/components/DocumentUpload";
 import VerificationTable from "@/components/VerificationTable";
 import ReportSummary from "@/components/ReportSummary";
-import { getDocTypeLabel, type ZipUploadData } from "@/lib/mockData";
+import FinalSummarySheet from "@/components/FinalSummarySheet";
+import { getDocTypeLabel, exportEvaluationToExcel, exportEvaluationToExcelDirect, DEFAULT_EVALUATION_SUMMARY, type ZipUploadData } from "@/lib/mockData";
 import { Button } from "@/components/ui/button";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 
@@ -48,6 +49,11 @@ const Index = () => {
   };
 
   const activeDoc = zipData?.documents.find((d) => d.id === activeDocId);
+  const firmName = zipData ? zipData.zipName.replace(/\.zip$/i, "") : "";
+  const evaluationRows =
+    zipData?.evaluationSummary && zipData.evaluationSummary.length > 0
+      ? zipData.evaluationSummary
+      : DEFAULT_EVALUATION_SUMMARY;
 
   return (
     <div className="min-h-screen bg-background flex flex-col">
@@ -70,7 +76,7 @@ const Index = () => {
                 New Upload
               </Button>
             )}
-            <div className="flex items-center gap-1.5 text-[10px] text-muted-foreground bg-success/10 text-success px-2.5 py-1 rounded-full font-medium">
+            <div className="flex items-center gap-1.5 text-[10px] bg-success/10 text-success px-2.5 py-1 rounded-full font-medium">
               <ShieldCheck className="w-3.5 h-3.5" />
               Secured
             </div>
@@ -105,6 +111,12 @@ const Index = () => {
                       {getDocTypeLabel(doc.docType)}
                     </TabsTrigger>
                   ))}
+                  <TabsTrigger
+                    value="final-summary"
+                    className="rounded-lg text-xs px-4 py-2 data-[state=active]:bg-card data-[state=active]:shadow-sm font-semibold text-primary"
+                  >
+                    Final Summary
+                  </TabsTrigger>
                 </TabsList>
 
                 {zipData.documents.map((doc) => (
@@ -128,6 +140,23 @@ const Index = () => {
                     </section>
                   </TabsContent>
                 ))}
+
+                <TabsContent value="final-summary" className="space-y-6 mt-4">
+                  <FinalSummarySheet
+                    tenderRefText="Tender Ref. No.232/CGMSCL/Drug&Medicine/2025-26, 05/02/2026"
+                    coverText="Cover A  Evaluation"
+                    firmNameText={`Firm Name- ${firmName}`}
+                    rows={evaluationRows}
+                    jobId={zipData.jobId}
+                    onDownloadExcel={() => {
+                      if (zipData.jobId) {
+                        exportEvaluationToExcel(zipData.jobId);
+                        return;
+                      }
+                      exportEvaluationToExcelDirect(firmName, evaluationRows);
+                    }}
+                  />
+                </TabsContent>
               </Tabs>
             </motion.div>
           )}

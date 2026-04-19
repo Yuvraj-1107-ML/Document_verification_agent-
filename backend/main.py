@@ -1,4 +1,6 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException
+import asyncio
+from pydantic import BaseModel, Field
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 import uvicorn
@@ -10,9 +12,11 @@ import base64
 import time
 import zipfile
 import io
+import re
 from ocr_service import OCRService
 from llm_extractor import LLMExtractor
 from seal_extractor import SealExtractor
+from comprehensive_evaluator import ComprehensiveEvaluator
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -30,6 +34,7 @@ app.add_middleware(
 ocr_service = OCRService()
 llm_extractor = LLMExtractor()
 seal_extractor = SealExtractor()
+comp_evaluator = ComprehensiveEvaluator()
 
 results_db = {}
 
@@ -39,11 +44,45 @@ DOC_TYPE_LABELS = {
     "copp-whogmp": "COPP / WHO GMP Certificate",
     "mmc": "MMC / Market Standing Certificate",
     "manufacturing-license": "Manufacturing License",
+    "tender-fee-emd-proof": "Proof of Tender Fees and EMD",
+    "emd-exemption-cert": "EMD Exemption Certificate",
 }
+
+
+def build_tender_evaluation_filename(firm_name: str) -> str:
+    """
+    Build a safe download filename in the required format:
+    Tender_Evaluation_<Firm-Name>.xlsx
+    """
+    cleaned_name = re.sub(r'[\\/:*?"<>|]+', " ", firm_name or "").strip()
+    cleaned_name = re.sub(r"\s+", "_", cleaned_name)
+    if not cleaned_name:
+        cleaned_name = "Firm-Name"
+    return f"Tender_Evaluation_{cleaned_name}.xlsx"
 
 
 def detect_doc_type(filename: str) -> str:
     lower = filename.lower()
+    normalized = re.sub(r"[^a-z0-9]+", "", lower)
+
+    if (
+        "proofoftenderfeesandemd" in normalized
+        or (
+            "tenderfee" in normalized
+            and "emd" in normalized
+            and ("proof" in normalized or "paid" in normalized)
+        )
+    ):
+        return "tender-fee-emd-proof"
+    if (
+        "emdexemptioncert" in normalized
+        or (
+            "emd" in normalized
+            and "exemption" in normalized
+            and ("cert" in normalized or "certificate" in normalized)
+        )
+    ):
+        return "emd-exemption-cert"
     if "copp" in lower or "gmp" in lower or "whogmp" in lower:
         return "copp-whogmp"
     if "mmc" in lower or "market" in lower:
@@ -73,6 +112,159 @@ def sse_event(event: str, data: dict) -> str:
     return f"event: {event}\ndata: {json.dumps(data)}\n\n"
 
 
+def _normalize_text(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", (value or "").strip().lower()).strip()
+
+
+def _is_yes(value: str) -> bool:
+    normalized = _normalize_text(value)
+    return normalized in {"yes", "y", "true", "applicable", "paid", "present"}
+
+
+def _is_no(value: str) -> bool:
+    normalized = _normalize_text(value)
+    return normalized in {"no", "n", "false", "not applicable", "notapplicable", "absent"}
+
+
+def _find_field_value(fields: list[dict], preferred_names: list[str]) -> str:
+    preferred = {_normalize_text(name) for name in preferred_names}
+    for field in fields:
+        field_name = _normalize_text(str(field.get("fieldName", "")))
+        if field_name in preferred:
+            return str(field.get("extractedValue", "")).strip()
+
+    for field in fields:
+        field_name = _normalize_text(str(field.get("fieldName", "")))
+        for name in preferred:
+            if name and name in field_name:
+                return str(field.get("extractedValue", "")).strip()
+    return ""
+
+
+def _has_detected_seal(fields: list[dict]) -> bool:
+    for field in fields:
+        if field.get("sealImage"):
+            return True
+        field_name = _normalize_text(str(field.get("fieldName", "")))
+        extracted_value = _normalize_text(str(field.get("extractedValue", "")))
+        if "seal" in field_name and _is_yes(extracted_value):
+            return True
+    return False
+
+
+def _get_row_by_sno(evaluation_summary: list[dict], sno: str) -> dict | None:
+    for row in evaluation_summary:
+        if str(row.get("S.No.", "")).strip() == str(sno):
+            return row
+    return None
+
+
+def apply_finance_document_overrides(evaluation_summary: list[dict], documents: list[dict]) -> list[dict]:
+    """
+    Override S.No. 1 and 2 using extracted details from dedicated supporting docs.
+    """
+    row_1 = _get_row_by_sno(evaluation_summary, "1")
+    row_2 = _get_row_by_sno(evaluation_summary, "2")
+    if row_1 is None and row_2 is None:
+        return evaluation_summary
+
+    tender_doc = next((doc for doc in documents if doc.get("docType") == "tender-fee-emd-proof"), None)
+    emd_exemption_doc = next((doc for doc in documents if doc.get("docType") == "emd-exemption-cert"), None)
+
+    if row_1 is not None:
+        if tender_doc:
+            fields = tender_doc.get("fields", [])
+            tender_fee_paid = _find_field_value(fields, ["Tender Fee Paid Online (Yes/No)"])
+            emd_paid = _find_field_value(fields, ["EMD Paid Online (Yes/No)"])
+            emd_amount = _find_field_value(fields, ["Submitted EMD Amount"])
+            utr_number = _find_field_value(fields, ["UTR Number"])
+            address = _find_field_value(fields, ["Address"])
+            seal_present = _has_detected_seal(fields)
+
+            paid_online = _is_yes(tender_fee_paid) or _is_yes(emd_paid) or bool(emd_amount) or bool(utr_number)
+            amount_available = bool(emd_amount and _normalize_text(emd_amount) not in {"not found", "extraction failed"})
+            utr_available = bool(utr_number and _normalize_text(utr_number) not in {"not found", "extraction failed"})
+
+            submitted_parts = [f"Paid Online: {'Yes' if paid_online else 'No'}"]
+            if amount_available:
+                submitted_parts.append(f"Submitted EMD Amount: {emd_amount}")
+            if utr_available:
+                submitted_parts.append(f"UTR Number: {utr_number}")
+            if address and _normalize_text(address) not in {"not found", "extraction failed"}:
+                submitted_parts.append(f"Address: {address}")
+            submitted_parts.append(f"Seal: {'Present' if seal_present else 'Not found'}")
+            row_1["Submitted"] = "; ".join(submitted_parts)
+
+            missing_parts = []
+            if not paid_online:
+                missing_parts.append("payment proof")
+            if paid_online and not amount_available:
+                missing_parts.append("EMD amount")
+            if paid_online and not utr_available:
+                missing_parts.append("UTR number")
+            if missing_parts:
+                row_1["As Per Requirement"] = "No"
+                row_1["Remark"] = f"Missing: {', '.join(missing_parts)}."
+            else:
+                row_1["As Per Requirement"] = "Yes"
+                row_1["Remark"] = "-"
+        else:
+            row_1["Submitted"] = "Not submitted."
+            row_1["As Per Requirement"] = "No"
+            row_1["Remark"] = "Proof of Tender Fee and EMD document not found."
+
+    if row_2 is not None:
+        if emd_exemption_doc:
+            fields = emd_exemption_doc.get("fields", [])
+            applicable = _find_field_value(fields, ["EMD Exemption Applicable (Yes/No)"])
+            not_applicable_statement = _find_field_value(fields, ["Certificate Not Applicable Statement (Yes/No)"])
+            address = _find_field_value(fields, ["Address"])
+            subject = _find_field_value(fields, ["Subject"])
+            tender_ref_no = _find_field_value(fields, ["Tender Reference Number"])
+            seal_present = _has_detected_seal(fields)
+
+            is_applicable = _is_yes(applicable)
+            is_not_applicable = _is_no(applicable) or _is_yes(not_applicable_statement)
+
+            if is_applicable:
+                submitted_parts = ["Applicable"]
+                if subject and _normalize_text(subject) not in {"not found", "extraction failed"}:
+                    submitted_parts.append(f"Subject: {subject}")
+                if tender_ref_no and _normalize_text(tender_ref_no) not in {"not found", "extraction failed"}:
+                    submitted_parts.append(f"Tender Reference Number: {tender_ref_no}")
+                if address and _normalize_text(address) not in {"not found", "extraction failed"}:
+                    submitted_parts.append(f"Address: {address}")
+                submitted_parts.append(f"Seal: {'Present' if seal_present else 'Not found'}")
+                row_2["Submitted"] = "; ".join(submitted_parts)
+
+                missing_parts = []
+                if not subject or _normalize_text(subject) in {"not found", "extraction failed"}:
+                    missing_parts.append("subject")
+                if not tender_ref_no or _normalize_text(tender_ref_no) in {"not found", "extraction failed"}:
+                    missing_parts.append("tender reference number")
+
+                if missing_parts:
+                    row_2["As Per Requirement"] = "No"
+                    row_2["Remark"] = f"Applicable certificate missing: {', '.join(missing_parts)}."
+                else:
+                    row_2["As Per Requirement"] = "Yes"
+                    row_2["Remark"] = "-"
+            elif is_not_applicable:
+                row_2["Submitted"] = "Not applicable"
+                row_2["As Per Requirement"] = "Yes"
+                row_2["Remark"] = "-"
+            else:
+                row_2["Submitted"] = "Unable to determine applicability."
+                row_2["As Per Requirement"] = "Pending"
+                row_2["Remark"] = "Clarify whether EMD exemption certificate is applicable."
+        else:
+            row_2["Submitted"] = "Not applicable"
+            row_2["As Per Requirement"] = "Yes"
+            row_2["Remark"] = "EMD exemption certificate document not found."
+
+    return evaluation_summary
+
+
 @app.post("/api/process-stream")
 async def process_upload_stream(file: UploadFile = File(...)):
     """
@@ -98,6 +290,7 @@ async def process_upload_stream(file: UploadFile = File(...)):
         documents = []
         doc_counter = 0
         doc_files_to_process = []
+        global_combined_text = ""
 
         # Prepare file list
         if file_format == "zip":
@@ -214,6 +407,8 @@ async def process_upload_stream(file: UploadFile = File(...)):
                     if content:
                         all_text += content + "\n"
 
+            global_combined_text += f"\n\n--- DOCUMENT: {doc_name} ---\n{all_text}"
+
             cache_msg = f"(from cache)" if elapsed < 2 else f"in {elapsed:.1f}s"
             yield sse_event("log", {
                 "message": f"  OCR complete {cache_msg} -- {total_pages} pages, {len(all_text)} chars extracted",
@@ -249,7 +444,9 @@ async def process_upload_stream(file: UploadFile = File(...)):
                 "progress": base_progress + 30,
             })
 
-            extracted_fields = llm_extractor.extract_fields(all_text, doc_type)
+            extracted_fields = await asyncio.to_thread(
+                llm_extractor.extract_fields, all_text, doc_type
+            )
 
             yield sse_event("log", {
                 "message": f"  AI extracted {len(extracted_fields)} fields successfully",
@@ -289,10 +486,23 @@ async def process_upload_stream(file: UploadFile = File(...)):
                 "progress": base_progress + 45,
             })
 
+        yield sse_event("log", {
+            "message": f"Running comprehensive 26-point evaluation on all documents...",
+            "step": "comp_eval",
+            "progress": 95,
+        })
+
+        evaluation_summary = await asyncio.to_thread(
+            comp_evaluator.evaluate_all_documents, global_combined_text
+        )
+        evaluation_summary = apply_finance_document_overrides(evaluation_summary, documents)
+
         # Final result
         result = {
+            "jobId": job_id,
             "zipName": file.filename,
             "documents": documents,
+            "evaluationSummary": evaluation_summary,
         }
         results_db[job_id] = result
 
@@ -395,6 +605,60 @@ async def process_upload(file: UploadFile = File(...)):
 @app.get("/api/health")
 async def health():
     return {"status": "ok"}
+
+
+@app.get("/api/export-evaluation/{job_id}")
+async def export_evaluation(job_id: str):
+    if job_id not in results_db:
+        raise HTTPException(status_code=404, detail="Job not found")
+    
+    result = results_db[job_id]
+    summary = result.get("evaluationSummary", [])
+    zip_name = result.get("zipName", "Evaluation")
+    firm_name = os.path.splitext(zip_name)[0]
+    
+    output_path = f"Evaluation_{job_id}.xlsx"
+    comp_evaluator.export_to_excel(summary, firm_name, output_path)
+    
+    return FileResponse(
+        output_path, 
+        filename=build_tender_evaluation_filename(firm_name),
+        background=None # Remove file after sending if needed, but for now just send it
+    )
+
+
+class EvaluationRow(BaseModel):
+    s_no: str = Field(alias="S.No.")
+    particular: str = Field(alias="Particular")
+    submitted: str = Field(alias="Submitted")
+    as_per_requirement: str = Field(alias="As Per Requirement")
+    remark: str = Field(alias="Remark")
+
+
+class ExportEvaluationRequest(BaseModel):
+    firm_name: str
+    evaluation_summary: list[EvaluationRow]
+
+
+@app.post("/api/export-evaluation")
+async def export_evaluation_direct(payload: ExportEvaluationRequest):
+    """
+    Export endpoint that does NOT depend on server-side job state.
+    Frontend can call this with the current evaluation summary to get an Excel
+    that matches the configured template.
+    """
+    export_id = str(uuid.uuid4())
+    output_path = f"Evaluation_{export_id}.xlsx"
+
+    summary_dicts = [row.model_dump(by_alias=True) for row in payload.evaluation_summary]
+    comp_evaluator.export_to_excel(summary_dicts, payload.firm_name, output_path)
+
+    safe_name = payload.firm_name or "Evaluation"
+    return FileResponse(
+        output_path,
+        filename=build_tender_evaluation_filename(safe_name),
+        background=None,
+    )
 
 
 if __name__ == "__main__":
